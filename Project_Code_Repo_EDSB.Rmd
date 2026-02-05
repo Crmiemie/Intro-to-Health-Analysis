@@ -1,0 +1,668 @@
+---
+title: "The Impact of COVID-19 on Mental Health in the US (Group Assignment)"
+author: "Chaoran Yang, Yinxi Jiang, Zhilong Shang, Xiaolu Luo, Qifan Zhang"
+date: "2026-01-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE}
+# Importing libraries
+packages = (c("ipumsr", "dplyr", "ggplot2", "tidyr","gtsummary","here", "rmdformats", "srvyr","knitr","kableExtra", "survey", "scales","marginaleffects", "fixest", "modelsummary"))
+
+package.check <- lapply(
+  packages,
+  FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+```
+
+# Loading data
+
+```{r}
+ddi <- read_ipums_ddi("nhis_00006.xml")
+data <- read_ipums_micro(ddi)
+head(data)
+```
+
+```{r}
+ipums_val_labels(data$SEX)
+```
+
+# Data cleaning & wrangling
+
+```{r}
+# Choosing analysis sample: adults in year 2017-19, 2021-2022
+filtered_data <- data %>%
+  filter(YEAR != 2020 & AGE >= 18 & AGE <= 99) %>%
+  mutate(
+    # Encoding: Pandemic era difining: 2017-19 as Baseline, 2021-22 as Pandemic Era
+    Pandemic_Era = case_when(
+      YEAR %in% c(2017, 2018, 2019) ~ "Pre_Pandemic (2017-19)",
+      YEAR %in% c(2021, 2022) ~ "Pandemic (2021-22)",
+      TRUE ~ NA_character_
+    ),
+    
+    Pandemic_Era = factor(Pandemic_Era, 
+                          levels = c("Pre_Pandemic (2017-19)", "Pandemic (2021-22)")),
+    
+    # Recode Outcomes: Define "High Frequency" as Daily(1) or Weekly(2)
+    High_Anxiety = case_when(
+      WORFREQ %in% c(1, 2) ~ 1,
+      WORFREQ %in% c(3, 4, 5) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    High_Depression = case_when(
+      DEPFREQ %in% c(1, 2) ~ 1,
+      DEPFREQ %in% c(3 ,4, 5) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # Recode SES Control (Education): Grouped into 4 standard categories
+    # Note: EDUC is treated as a pre-determined baseline SES
+    Education_levels = case_when(
+      EDUC < 200 ~ "Less than HS",
+      EDUC >= 200 & EDUC < 300 ~ "High School",
+      EDUC >= 300 & EDUC < 400 ~ "Some College",
+      EDUC >= 400 & EDUC < 900 ~ "Bachelor or Higher",
+      TRUE ~ NA_character_
+    ),
+    # Setting education level order
+    Education_levels = factor(Education_levels,
+                             level = c("Less than HS", "High School", "Some College", "Bachelor or Higher")),
+    
+    # # Recode Economic Mechanism (SNAP): Treated as time-varying economic shock
+    Received_SNAP = case_when(
+      GOTSTAMPFAM %in% c(20, 21, 22) ~ "Yes",
+      GOTSTAMPFAM == 10 ~ "No",
+      TRUE ~ NA_character_
+    ),
+    
+    # Encoding: Race
+    Race_Ethnicity = case_when(
+      RACENEW == 100 ~ "White",
+      RACENEW == 200 ~ "Black",
+      RACENEW == 400 ~ "Asian",
+      RACENEW %in% c(300, 500, 510, 520, 530, 540, 541, 542) ~ "Other/Multiple",
+      RACENEW >= 900 ~ NA_character_, 
+      TRUE ~ NA_character_
+    ),
+    Race_Ethnicity = factor(Race_Ethnicity, 
+                            levels = c("White", "Black", "Asian", "Other/Multiple"))
+  ) %>%
+  # Drop missing values to ensure Complete Case Analysis for regression models
+  drop_na(Pandemic_Era, High_Anxiety, Education_levels, Received_SNAP, Race_Ethnicity, High_Depression)
+
+# Cheacking for data vloume
+print(paste("Row_data sample size:", nrow(data)))
+print(paste("Filtered_data sample size:", nrow(filtered_data)))
+table(filtered_data$Pandemic_Era)
+
+```
+
+# EDA
+
+NOTE: All prevalence rates in charts are WEIGHTED using 'SAMPWEIGHT' to represent the US adult population, except for the sample balance plot.
+
+```{r}
+# Setting consistent theme
+my_theme <-theme_minimal(base_size = 14) + 
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#2c3e50"),
+    plot.subtitle = element_text(color = "#7f8c8d"),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+## Sample balance
+
+```{r}
+# Checking data volume by year
+sample_balance <- filtered_data %>%
+  group_by(YEAR) %>%
+  summarise(Count = n()) %>%
+  ggplot(aes(x = factor(YEAR), y = Count)) + 
+  geom_col(fill = "#E46AA3", width = 0.3, alpha = 0.9) + 
+  geom_text(aes(label = scales::comma(Count)), vjust = -0.3, size = 4) +
+  labs(
+    title = "Sample Distribution by Survey Year",
+    subtitle = "Number of adult respondent (Age 18+) after filtering",
+    x = "Survey Year",
+    y = "Number of Respondents"
+  ) + 
+  scale_y_continuous(labels = scales::comma) + 
+  my_theme
+
+print(sample_balance)
+```
+
+## Weighted Descriptive Statistics
+
+```{r}
+# --- Table: Weighted Descriptive Statistics (Demographics) ---
+
+# Data Preparation: Select variables and factorize SEX
+table_data <- filtered_data %>%
+  select(
+    Pandemic_Era, 
+    SEX, 
+    Race_Ethnicity, 
+    Education_levels, 
+    Received_SNAP, 
+    SAMPWEIGHT
+  ) %>%
+  mutate(
+    # Convert raw SEX codes to labeled factor
+    SEX = factor(SEX, levels = c(1, 2), labels = c("Male", "Female"))
+  )
+
+# Define Survey Design
+des_table <- svydesign(ids = ~1, weights = ~SAMPWEIGHT, data = table_data)
+
+# Generate Weighted Summary Table
+table1 <- des_table %>%
+  tbl_svysummary(
+    by = Pandemic_Era, 
+    include = c(SEX, Race_Ethnicity, Education_levels, Received_SNAP),
+    
+    # Display weighted percentages only (cleaner look)
+    statistic = list(all_categorical() ~ "{p}%"), 
+    
+    # Keep 1 decimal place
+    digits = list(all_categorical() ~ 1),
+    
+    # Custom labels
+    label = list(
+      SEX ~ "Gender",
+      Race_Ethnicity ~ "Race / Ethnicity",
+      Education_levels ~ "Education Level",
+      Received_SNAP ~ "Received SNAP (Family)"
+    ),
+    missing = "no"
+  ) %>%
+  add_overall() %>% 
+  modify_header(label = "**Characteristic**") %>% 
+  bold_labels() %>% 
+  modify_caption("**Table. Weighted Characteristics of Study Population (2017-2022)**")
+
+# Print Table (Converted to flex_table for font sizing)
+# Note: Using as_flex_table allows resizing if the table is too large
+library(flextable) 
+table1 %>%
+  as_flex_table() %>%
+  fontsize(size = 9) %>%
+  autofit()                # Auto-adjust column widths
+```
+
+## Main trend of anxiety
+
+```{r}
+# --- Figure: Main Trend of Anxiety (Weighted) ---
+# Visualizing the aggregate change in anxiety prevalence before and during the pandemic
+Anxiety_Rate <- filtered_data %>%
+  group_by(Pandemic_Era) %>%
+  summarise(
+    # Calculate weighted mean using survey weights (SAMPWEIGHT) to represent US population
+    Anxiety_Rate = weighted.mean(High_Anxiety, SAMPWEIGHT, na.rm = TRUE),
+    # Calculate approximate standard error for error bars
+    se = sd(High_Anxiety, na.rm = TRUE) / sqrt(n()) 
+  ) %>%
+  ggplot(aes(x = Pandemic_Era, y = Anxiety_Rate, fill = Pandemic_Era)) +
+  geom_col(width = 0.3, show.legend = FALSE) +
+  # Add 95% Confidence Intervals (1.96 * SE)
+  geom_errorbar(aes(ymin = Anxiety_Rate - 1.96*se, ymax = Anxiety_Rate + 1.96*se), 
+                width = 0.1, color = "#2c3e50") +
+  # Add percentage labels above bars
+  geom_text(aes(label = scales::percent(Anxiety_Rate, accuracy = 0.1)), 
+            vjust = -0.45, fontface = "bold") +
+  # Custom colors: Green for Pre-Pandemic, Pink for Pandemic
+  scale_fill_manual(values = c("#2CA25F", "#E46AA3")) + 
+  scale_y_continuous(labels = scales::percent_format()) + 
+  labs(
+    title = "Rise in Frequent Anxiety Symptoms During the Pandemic",
+    subtitle = "Weighted proportion of US adults reporting daily or weekly anxiety", 
+    x = NULL,
+    y = "Prevalence Rate (Weighted)"
+  ) +
+  my_theme
+
+print(Anxiety_Rate)
+```
+
+## Socio-economic status heterogeneity
+
+```{r}
+# --- Figure: Socio-economic Status Heterogeneity ---
+# Analyzing how anxiety trends differ across educational groups (SES proxy)
+Status_graph <- filtered_data %>%
+  # Group by both time period and education to observe interaction effects
+  group_by(Pandemic_Era, Education_levels) %>%
+  summarise(
+      # Calculate weighted prevalence to ensure representativeness within each education group
+      Anxiety_Rate = weighted.mean(High_Anxiety, SAMPWEIGHT, na.rm = TRUE), 
+      .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Education_levels, y = Anxiety_Rate, fill = Pandemic_Era)) +
+  geom_col(position = "dodge", alpha = 0.9) +
+  scale_fill_manual(values = c("#2CA25F", "#E46AA3"), name = "Time Period") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Anxiety Trends by Educational Attainment",
+    subtitle = "Weighted comparison across socioeconomic groups",
+    x = NULL,
+    y = "Prevalence of High Anxiety"
+  ) +
+  my_theme +
+  # Prevent text overlap for long education categories
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 0.8)
+        )
+
+print(Status_graph)
+```
+
+## Anxiety Faceted Heatmap
+
+```{r}
+# --- Figure: Anxiety Faceted Heatmap ---
+# Exploring the interaction between Age and Education on anxiety risk
+heatmap_data <- filtered_data %>%
+  # Create discrete Age Groups to analyze life-stage differences (Young vs. Old)
+  mutate(Age_Group = cut(AGE, 
+                         breaks = c(17, 29, 44, 64, 85), 
+                         labels = c("18-29", "30-44", "45-64", "65+"))) %>%
+  # Group by three dimensions to calculate specific cell values for the heatmap
+  group_by(Pandemic_Era, Education_levels, Age_Group) %>%
+  summarise(
+      # Apply weights
+      Anxiety_Rate = weighted.mean(High_Anxiety, SAMPWEIGHT, na.rm = TRUE), 
+      .groups = "drop"
+  )
+
+p_heatmap <- ggplot(heatmap_data %>% filter(!is.na(Age_Group)), aes(x = Age_Group, y = Education_levels, fill = Anxiety_Rate)) +
+  geom_tile(color = "white", size = 0.5) + 
+  # Create side-by-side panels to visualize the shift in "risk hotspots" over time
+  facet_wrap(~Pandemic_Era) +
+  # 'PiYG' palette: Green = Low Anxiety, Pink/Purple = High Anxiety
+  scale_fill_distiller(palette = "PiYG", direction = -1, labels = scales::percent) +
+  geom_text(aes(label = scales::percent(Anxiety_Rate, accuracy = 1)), color = "black", size = 3) +
+  labs(
+    title = "Heatmap of Anxiety Risk: Age vs. Education",
+    subtitle = "Comparing weighted risk hotspots before and during the pandemic",
+    x = "Age Group",
+    y = "Education Level",
+    fill = "Anxiety Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(), 
+    axis.text.x = element_text(angle = 0),
+    legend.position = "right"
+  )
+
+print(p_heatmap)
+```
+
+## The Age Curve of Mental Health
+
+```{r}
+# --- Figure: Age Curve of Mental Health (Smoothed Trend) ---
+# Visualizing the continuous relationship between Age and Anxiety Probability
+p_trend <- ggplot(filtered_data, 
+                  aes(x = AGE, y = High_Anxiety, 
+                      color = Pandemic_Era, fill = Pandemic_Era, 
+                      weight = SAMPWEIGHT)) +
+
+  # Use Generalized Additive Model (GAM) for smoothing
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), alpha = 0.2) + 
+  
+  scale_color_manual(values = c("#2CA25F", "#E46AA3")) + 
+  scale_fill_manual(values = c("#2CA25F", "#E46AA3")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "The 'Youth Crisis': Anxiety Trends Across Age",
+    subtitle = "Weighted smoothed probability of high anxiety by age (with 95% CI)",
+    x = "Age (Years)",
+    y = "Probability of High Anxiety",
+    color = "Time Period",
+    fill = "Time Period"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+print(p_trend)
+```
+
+## Trends in Frequent Depressive Symptoms Among U.S. Adults
+
+```{r}
+# --- Figure: Depression Trends Over Time (2017-2022) ---
+# Objective: Visualize the trajectory of depression prevalence and check for pre-trends.
+
+COL_PRE  <- "#2CA25F"
+COL_POST <- "#E46AA3"
+
+trend_depression <- filtered_data %>%
+  group_by(YEAR) %>%
+  summarise(
+    Depression_Rate = weighted.mean(High_Depression, SAMPWEIGHT, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Era = ifelse(YEAR <= 2019, "Pre", "Pandemic"),
+    Era = factor(Era, levels = c("Pre", "Pandemic"))
+  )
+
+ggplot(trend_depression, aes(x = YEAR, y = Depression_Rate)) +
+  geom_line(linewidth = 1, color = "black") +
+  # Add points colored by Era to highlight the structural break
+  geom_point(aes(color = Era), size = 2.5) +
+  scale_color_manual(values = c("Pre" = COL_PRE, "Pandemic" = COL_POST), name = "Time Period") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  # Explicitly set x-axis breaks to show the gap for the excluded year (2020)
+  scale_x_continuous(breaks = c(2017, 2018, 2019, 2021, 2022)) +
+  labs(
+    title = "Trends in Frequent Depressive Symptoms Among U.S. Adults, 2017–2022",
+    subtitle = "Weighted prevalence of adults reporting daily/weekly depression (Age 18+)",
+    x = "Survey Year",
+    y = "Prevalence of High Depression"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(color = "grey40", size = 10),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+print(trend_depression)
+
+```
+
+## Frequent Anxiety Symptoms by Household SNAP Receip
+
+```{r}
+# --- Figure: Economic Mechanism Check (SNAP vs. Depression) ---
+# Initialize Survey Design
+des <- svydesign(ids = ~1, weights = ~SAMPWEIGHT, data = filtered_data)
+
+# Calculate Weighted Statistics
+snap_depression_w <- svyby(
+  ~High_Depression,
+  ~Pandemic_Era + Received_SNAP,
+  des,
+  svymean,
+  na.rm = TRUE,
+  vartype = c("se")
+) %>%
+  as.data.frame() %>%
+  rename(Depression_Rate = High_Depression, se = se) %>%
+  mutate(
+    # Setting factor order
+    Pandemic_Era = factor(Pandemic_Era,
+                          levels = c("Pre_Pandemic (2017-19)", "Pandemic (2021-22)")),
+    Received_SNAP = factor(Received_SNAP, levels = c("No", "Yes")),
+    # Calculate 95% Confidence Intervals for error bars
+    lo = Depression_Rate - 1.96 * se,
+    hi = Depression_Rate + 1.96 * se
+  )
+
+ggplot(snap_depression_w, aes(x = Received_SNAP, y = Depression_Rate, fill = Pandemic_Era)) +
+  # Side-by-side bars to compare time periods within each SNAP category
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  # Add error bars
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.15, linewidth = 0.6) +
+  geom_text(aes(label = percent(Depression_Rate, accuracy = 0.1)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.35, size = 4) +
+  scale_fill_manual(values = c("Pre_Pandemic (2017-19)" = COL_PRE,
+                               "Pandemic (2021-22)" = COL_POST),
+                    name = "Time Period") +
+  scale_y_continuous(labels = percent_format(), limits = c(0, NA)) +
+  labs(
+    title = "Frequent Depression by SNAP Receipt (Weighted): Pre vs Pandemic",
+    subtitle = "NHIS sample adult weights; 95% confidence intervals shown",
+    x = "Household Received SNAP",
+    y = "Prevalence of High Depression"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+## Mental Health Differences by SES Type: Education (Pre-determined) vs SNAP (Time-varying)
+
+```{r}
+# --- Figure: Mental Health Differences by SES Type (Faceted) ---
+ses_long <- filtered_data %>%
+  select(Pandemic_Era, High_Anxiety, Education_levels, Received_SNAP) %>%
+  pivot_longer(
+    cols = c(Education_levels, Received_SNAP),
+    names_to = "SES_Type",
+    values_to = "SES_Group"
+  ) %>%
+  mutate(
+    Pandemic_Era = factor(Pandemic_Era, levels = c("Pre_Pandemic (2017-19)", "Pandemic (2021-22)")),
+    SES_Type = factor(SES_Type, levels = c("Education_levels", "Received_SNAP"), labels = c("Education", "SNAP"))
+  ) %>%
+  # Calculate WEIGHTED means before plotting
+  group_by(Pandemic_Era, SES_Type, SES_Group) %>%
+  summarise(
+    Anxiety_Rate = weighted.mean(High_Anxiety, filtered_data$SAMPWEIGHT[1:n()], na.rm = TRUE), 
+    .groups = "drop"
+  )
+
+ggplot(ses_long, aes(x = SES_Group, y = Anxiety_Rate, fill = Pandemic_Era)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~ SES_Type, scales = "free_x") +
+  scale_fill_manual(
+    values = c("Pre_Pandemic (2017-19)" = COL_PRE, "Pandemic (2021-22)" = COL_POST),
+    name = "Time Period"
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Mental Health Differences by SES Type",
+    subtitle = "Weighted prevalence of high anxiety: Education (pre-determined) vs SNAP (time-varying)",
+    x = NULL,
+    y = "Prevalence of High Anxiety"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(color = "grey40", size = 13),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    # Rotate x-axis text to prevent overlap
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+## Gender Differences in Anxiety Symptoms, Pre vs During Pandemic
+
+```{r}
+# --- Figure: Gender Differences in Anxiety (Weighted) ---
+COL_PRE  <- "#2CA25F"
+COL_POST <- "#E46AA3"
+
+filtered_data <- filtered_data %>%
+  mutate(Gender = factor(SEX, levels = c(1, 2), labels = c("Male", "Female")))
+
+
+# Define survey object using 'SAMPWEIGHT'
+des <- svydesign(ids = ~1, weights = ~SAMPWEIGHT, data = filtered_data)
+
+# Compute weighted prevalence and standard errors for each Gender-Era combination
+gender_anxiety_w <- svyby(
+  ~High_Anxiety,
+  ~Pandemic_Era + Gender,
+  des,
+  svymean,
+  na.rm = TRUE,
+  vartype = "se"
+) %>%
+  as.data.frame() %>%
+  rename(Anxiety_Rate = High_Anxiety, se = se) %>%
+  mutate(
+    Pandemic_Era = factor(Pandemic_Era,
+                          levels = c("Pre_Pandemic (2017-19)", "Pandemic (2021-22)")),
+    Gender = factor(Gender, levels = c("Male", "Female")),
+    lo = Anxiety_Rate - 1.96 * se,
+    hi = Anxiety_Rate + 1.96 * se
+  )
+
+ggplot(gender_anxiety_w, aes(x = Gender, y = Anxiety_Rate, fill = Pandemic_Era)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  # Add error bars
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.15, linewidth = 0.6) +
+  # Add percentage labels
+  geom_text(aes(label = percent(Anxiety_Rate, accuracy = 0.1)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.35, size = 4) +
+  scale_fill_manual(values = c("Pre_Pandemic (2017-19)" = COL_PRE,
+                               "Pandemic (2021-22)" = COL_POST),
+                    name = "Time Period") +
+  scale_y_continuous(labels = percent_format(), limits = c(0, NA)) +
+  labs(
+    title = "Gender Differences in Anxiety Symptoms, Pre vs During Pandemic",
+    subtitle = "NHIS sample adult weights; 95% confidence intervals shown",
+    x = "Gender",
+    y = "Prevalence of High Anxiety"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+# Regression Analysis
+
+## Anxiety
+
+```{r}
+
+# Model 1: Demographics
+logit <- feglm(High_Anxiety ~ Pandemic_Era + AGE + SEX + Race_Ethnicity, 
+               data = filtered_data, 
+               family = binomial(link = "logit"), 
+               weights = filtered_data$SAMPWEIGHT,
+               vcov = "hetero")
+
+# Model 2: + Baseline SES (Educ)
+logit_educ <- feglm(High_Anxiety ~ Pandemic_Era + AGE + SEX + Race_Ethnicity +
+                        Education_levels, 
+                    data = filtered_data, 
+                    family = binomial(link = "logit"), 
+                    weights = filtered_data$SAMPWEIGHT,
+                    vcov = "hetero")
+
+# Model 3: + Economic Mechanism (SNAP)
+logit_full <- feglm(High_Anxiety ~ Pandemic_Era + AGE + SEX + Race_Ethnicity +
+                        Education_levels + Received_SNAP, 
+                    data = filtered_data, 
+                    family = binomial(link = "logit"), 
+                    weights = filtered_data$SAMPWEIGHT,
+                    vcov = "hetero")
+
+# Regression table
+etable(logit, logit_educ, logit_full, 
+       headers = c("Base", "+Educ", "+SNAP"),
+       digits = 3,
+       title = "Impact of Pandemic on Anxiety (Logit Coefficients)"
+       ) 
+
+# AME Calculation
+ame_logit <- avg_slopes(logit, variables = "Pandemic_Era")
+ame_logit_educ <- avg_slopes(logit_educ, variables = "Pandemic_Era")
+ame_logit_full <- avg_slopes(logit_full, variables = "Pandemic_Era")
+
+# AME table
+modelsummary(
+  list(
+    "Base" = ame_logit, 
+    "+Educ" = ame_logit_educ, 
+    "+SNAP" = ame_logit_full),
+  estimate = "{estimate} [{conf.low}, {conf.high}]", 
+  statistic = NULL,
+  gof_omit = ".*",
+  title = "Average Marginal Effects of Pandemic Era on Anxiety Probability"
+)
+```
+
+## Depression
+
+```{r}
+# Model 1: Baseline (Demographics only)
+logit_dep <- feglm(High_Depression ~ Pandemic_Era + AGE + SEX + Race_Ethnicity, 
+                   data = filtered_data, 
+                   family = binomial(link = "logit"), 
+                   weights = filtered_data$SAMPWEIGHT,
+                   vcov = "hetero"
+                   )
+
+# Model 2: + Baseline SES (Education)
+logit_dep_educ <- feglm(High_Depression ~ Pandemic_Era + AGE + SEX + Race_Ethnicity +
+                            Education_levels, 
+                        data = filtered_data, 
+                        family = binomial(link = "logit"), 
+                        weights = filtered_data$SAMPWEIGHT,
+                        vcov = "hetero"
+                        )
+
+# Model 3: + Economic Mechanism (SNAP)
+logit_dep_full <- feglm(High_Depression ~ Pandemic_Era + AGE + SEX + Race_Ethnicity +
+                            Education_levels + Received_SNAP, 
+                        data = filtered_data, 
+                        family = binomial(link = "logit"), 
+                        weights = filtered_data$SAMPWEIGHT,
+                        vcov = "hetero"
+                        )
+
+# Regression Table
+etable(logit_dep, logit_dep_educ, logit_dep_full, 
+       headers = c("Base", "+Educ", "+SNAP"),
+       digits = 3,  
+       title = "Impact of Pandemic on Depression (Logit Coefficients)")
+
+# AME
+ame_dep_base <- avg_slopes(logit_dep, variables = "Pandemic_Era")
+ame_dep_educ <- avg_slopes(logit_dep_educ, variables = "Pandemic_Era")
+ame_dep_full <- avg_slopes(logit_dep_full, variables = "Pandemic_Era")
+
+modelsummary(
+  list(
+    "Base Model" = ame_dep_base, 
+    "Control for Educ" = ame_dep_educ, 
+    "Control for SNAP" = ame_dep_full
+  ),
+  estimate = "{estimate} [{conf.low}, {conf.high}]", 
+  statistic = NULL, 
+  fmt = 3,
+  gof_omit = ".*",
+  title = "Average Marginal Effects of Pandemic Era on Depression Probability"
+)
+```
